@@ -89,10 +89,22 @@ def _contains_text(value: Any, needle: str) -> bool:
     return False
 
 
-def _record_matches_hp(doc_type: str, record: dict[str, Any], hp_norm: str) -> bool:
-    # HP mapping is driven by q=<hp>; avoid hard field assumptions at this stage.
-    _ = (doc_type, record, hp_norm)
-    return True
+def _contract_matches_hp(record: dict[str, Any], hp_norm: str) -> bool:
+    supplier_values = _value_text_list(record.get("supplier_code"))
+    if not supplier_values:
+        return False
+    return any(_digits_equal(value, hp_norm) for value in supplier_values)
+
+
+def _supports_local_match(record: dict[str, Any], hp_norm: str) -> tuple[bool, str]:
+    entity_values = _value_text_list(record.get("entity_id"))
+    normalized_entity_values = [digits_only(value) for value in entity_values if digits_only(value)]
+    if normalized_entity_values:
+        matched = any(_digits_equal(value, hp_norm) for value in normalized_entity_values)
+        if matched:
+            return True, "verified"
+        return False, "verified_non_match"
+    return True, "unverified"
 
 
 def _record_year(record: dict[str, Any], doc_type: str) -> int | None:
@@ -159,6 +171,7 @@ def _build_filters(doc_type: str, hp_norm: str, publisher_filter: str) -> list[d
     filters: list[dict[str, Any]] = []
     if doc_type == "contract-spending":
         filters.append({"path": "supplier_code", "terms": [hp_norm]})
+    _ = publisher_filter
     return filters
 
 
@@ -228,6 +241,7 @@ def _run_paged_pull(
     filters_json: str,
     server_strategy: str,
     query_params_base: dict[str, Any],
+    debug_enabled: bool,
 ) -> dict[str, Any]:
     offset = 0
     fetched_raw_rows = 0
@@ -239,6 +253,9 @@ def _run_paged_pull(
     first_page_hits: int | None = None
     last_error = ""
     debug_pages: list[dict[str, Any]] = []
+    fetched_candidates_total = 0
+    local_matched_total = 0
+    unverified_kept_total = 0
 
     while True:
         if fetched_raw_rows >= row_cap:
@@ -257,25 +274,30 @@ def _run_paged_pull(
         page_records = page_result.get("records", [])
         page_hits = len(page_records)
         total_available = int(page_result.get("total", total_available))
-
-        debug_pages.append(
-            {
-                "doc_type": doc_type,
-                "server_strategy": server_strategy,
-                "q": q,
-                "filters": filters_json or "",
-                "size": request_size,
-                "from": offset,
-                "hits_returned": page_hits,
-                "total_available": total_available,
-                "url": request_url,
-                "ok": bool(page_result.get("ok", False)),
-                "error": page_result.get("error", ""),
-            }
-        )
+        fetched_candidates_total += page_hits
+        page_local_match_count = 0
+        page_kept_after_filters = 0
 
         if not page_result.get("ok", False):
             last_error = page_result.get("error", "Unknown API error")
+            if debug_enabled:
+                debug_pages.append(
+                    {
+                        "doc_type": doc_type,
+                        "server_strategy": server_strategy,
+                        "q": q,
+                        "filters": filters_json or "",
+                        "size": request_size,
+                        "from": offset,
+                        "hits_returned": page_hits,
+                        "local_matched_rows": 0,
+                        "kept_after_filters": 0,
+                        "total_available": total_available,
+                        "url": request_url,
+                        "ok": False,
+                        "error": last_error,
+                    }
+                )
             if page_count == 0:
                 return {
                     "status": "error",
@@ -287,6 +309,9 @@ def _run_paged_pull(
                     "request_url": request_url,
                     "debug_pages": debug_pages,
                     "first_page_hits": 0,
+                    "fetched_candidates_rows": 0,
+                    "local_matched_rows": 0,
+                    "unverified_rows": 0,
                 }
             break
 
@@ -304,8 +329,22 @@ def _run_paged_pull(
         query_params_used["filters"] = filters_json
 
         for record in page_records:
-            if not _record_matches_hp(doc_type, record, hp_norm):
-                continue
+            is_unverified_support = False
+            if doc_type == "contract-spending":
+                if not _contract_matches_hp(record, hp_norm):
+                    continue
+                page_local_match_count += 1
+            elif doc_type == "supports":
+                keep_support_row, support_match_status = _supports_local_match(record, hp_norm)
+                if not keep_support_row:
+                    continue
+                page_local_match_count += 1
+                if support_match_status == "unverified":
+                    is_unverified_support = True
+                    unverified_kept_total += 1
+            else:
+                page_local_match_count += 1
+
             if not _record_matches_years(record, doc_type, years_set):
                 continue
             if doc_type == "contract-spending" and not _record_matches_publisher(
@@ -317,14 +356,39 @@ def _run_paged_pull(
             ):
                 continue
 
+            page_kept_after_filters += 1
             record_with_meta = dict(record)
             record_with_meta["hp"] = hp_norm
             record_with_meta["company_name"] = company_name or ""
             record_with_meta["doc_type"] = doc_type
+            if doc_type == "supports":
+                record_with_meta["hp_match_status"] = (
+                    "unverified" if is_unverified_support else "verified"
+                )
             record_with_meta["query_params_used"] = json.dumps(
                 query_params_used, ensure_ascii=False
             )
             collected.append(record_with_meta)
+
+        local_matched_total += page_local_match_count
+        if debug_enabled:
+            debug_pages.append(
+                {
+                    "doc_type": doc_type,
+                    "server_strategy": server_strategy,
+                    "q": q,
+                    "filters": filters_json or "",
+                    "size": request_size,
+                    "from": offset,
+                    "hits_returned": page_hits,
+                    "local_matched_rows": page_local_match_count,
+                    "kept_after_filters": page_kept_after_filters,
+                    "total_available": total_available,
+                    "url": request_url,
+                    "ok": True,
+                    "error": "",
+                }
+            )
 
         offset += request_size
         if total_available and offset >= total_available:
@@ -346,6 +410,9 @@ def _run_paged_pull(
         "request_url": request_url,
         "debug_pages": debug_pages,
         "first_page_hits": first_page_hits or 0,
+        "fetched_candidates_rows": fetched_candidates_total,
+        "local_matched_rows": local_matched_total,
+        "unverified_rows": unverified_kept_total,
     }
 
 
@@ -374,6 +441,7 @@ def fetch_doc_type_for_hp(
     keyword: str,
     page_size: int,
     row_cap: int,
+    debug_enabled: bool = False,
 ) -> dict[str, Any]:
     hp_norm = digits_only(hp)
     if not hp_norm:
@@ -422,12 +490,14 @@ def fetch_doc_type_for_hp(
             filters_json=supplier_filters_json,
             server_strategy="q_plus_supplier_code_filter",
             query_params_base=query_params_base,
+            debug_enabled=debug_enabled,
         )
 
         debug_pages = list(filtered_result.get("debug_pages", []))
         need_fallback = (
             filtered_result.get("status") == "error"
             or filtered_result.get("first_page_hits", 0) == 0
+            or filtered_result.get("local_matched_rows", 0) == 0
         )
         if not need_fallback:
             filtered_result["debug_pages"] = debug_pages
@@ -446,13 +516,20 @@ def fetch_doc_type_for_hp(
             filters_json="",
             server_strategy="q_only_fallback",
             query_params_base=query_params_base,
+            debug_enabled=debug_enabled,
         )
         fallback_result["debug_pages"] = debug_pages + fallback_result.get(
             "debug_pages", []
         )
+        if fallback_result.get("local_matched_rows", 0) == 0:
+            fallback_result["warning"] = (
+                "No contract-spending rows matched supplier_code for this HP "
+                f"(fetched_candidates={fallback_result.get('fetched_candidates_rows', 0)}, "
+                f"matched_rows={fallback_result.get('local_matched_rows', 0)})."
+            )
         return fallback_result
 
-    return _run_paged_pull(
+    result = _run_paged_pull(
         doc_type=doc_type,
         hp_norm=hp_norm,
         company_name=company_name,
@@ -465,4 +542,10 @@ def fetch_doc_type_for_hp(
         filters_json="",
         server_strategy="q_primary",
         query_params_base=query_params_base,
+        debug_enabled=debug_enabled,
     )
+    if doc_type == "supports" and result.get("unverified_rows", 0) > 0:
+        result["warning"] = (
+            f"Supports rows with missing entity_id kept as unverified: {result.get('unverified_rows', 0)}"
+        )
+    return result
