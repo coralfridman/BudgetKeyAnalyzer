@@ -1,50 +1,69 @@
-import io
 import json
-import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date
 from typing import Any
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import requests
 import streamlit as st
 
-API_BASE_URL = "https://next.obudget.org/search"
-REQUEST_TIMEOUT_SECONDS = 30
+from tools.analysis import (
+    build_master_joined_table,
+    compute_management_summary,
+    ensure_output_columns,
+    publisher_suggestions_from_results,
+    records_to_dataframe as records_to_dataframe_bulk,
+)
+from tools.budgetkey_search import digits_only, safe_number, safe_text, search_page
+from tools.bulk import normalize_uploaded_dataframe, process_single_hp
+from tools.export import (
+    build_combined_report_xlsx,
+    build_report_bundle_zip,
+    dataframe_to_csv_bytes,
+    dataframe_to_excel_bytes,
+)
+from tools.plots import create_management_charts, figure_to_png_bytes
 
 
-def _first_scalar(value: Any) -> Any:
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def human_number(value: float | int | None) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def stringify_for_table(value: Any) -> Any:
     if isinstance(value, list):
-        return value[0] if value else None
+        return " | ".join(str(item) for item in value if item is not None)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
     return value
 
 
-def _to_text(value: Any) -> str:
-    value = _first_scalar(value)
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def _to_number(value: Any) -> float | None:
-    value = _first_scalar(value)
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        cleaned = value.replace(",", "").replace("₪", "").strip()
-        if not cleaned:
-            return None
-        try:
-            return float(cleaned)
-        except ValueError:
-            return None
-    return None
-
-
-def _digits_only(value: Any) -> str:
-    digits = "".join(ch for ch in str(value) if ch.isdigit())
-    return digits.lstrip("0")
+def search_api(doc_type: str, q: str, size: int, from_offset: int, filters_json: str = "") -> dict[str, Any]:
+    response = search_page(
+        doc_type=doc_type,
+        q=q,
+        size=int(size),
+        from_offset=int(from_offset),
+        filters_json=filters_json,
+    )
+    return {
+        "ok": bool(response.get("ok")),
+        "records": response.get("records", []),
+        "total": safe_int(response.get("total"), 0),
+        "error": response.get("error", ""),
+        "url": response.get("url", ""),
+    }
 
 
 def _value_matches_filter(value: Any, expected: str, field_name: str) -> bool:
@@ -53,7 +72,7 @@ def _value_matches_filter(value: Any, expected: str, field_name: str) -> bool:
     if value is None:
         return False
     if field_name in {"supplier_code", "entity_id"}:
-        return _digits_only(value) == _digits_only(expected)
+        return digits_only(value) == digits_only(expected)
     return expected.casefold() in str(value).casefold()
 
 
@@ -68,82 +87,6 @@ def _filter_seems_applied(
         _value_matches_filter(record.get(field_name), expected, field_name)
         for record in records
     )
-
-
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _human_number(value: float | int | None) -> str:
-    if value is None:
-        return "N/A"
-    try:
-        return f"{float(value):,.0f}"
-    except (TypeError, ValueError):
-        return "N/A"
-
-
-def _stringify_for_table(value: Any) -> Any:
-    if isinstance(value, list):
-        scalar_items = [str(item) for item in value if item is not None]
-        return " | ".join(scalar_items)
-    if isinstance(value, dict):
-        return json.dumps(value, ensure_ascii=False)
-    return value
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def search_api(
-    doc_type: str,
-    q: str,
-    size: int,
-    from_offset: int,
-    filters_json: str = "",
-) -> dict[str, Any]:
-    url = f"{API_BASE_URL}/{doc_type}"
-    params: dict[str, Any] = {"size": size, "from": from_offset}
-    if q:
-        params["q"] = q
-    if filters_json:
-        params["filters"] = filters_json
-
-    try:
-        response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        payload = response.json()
-        hits = payload.get("search_results", [])
-        records = [hit.get("source", {}) for hit in hits if isinstance(hit, dict)]
-        total = (
-            payload.get("search_counts", {})
-            .get("_current", {})
-            .get("total_overall", len(records))
-        )
-        return {
-            "ok": True,
-            "records": records,
-            "total": _safe_int(total, len(records)),
-            "error": "",
-            "url": response.url,
-        }
-    except requests.RequestException as exc:
-        return {
-            "ok": False,
-            "records": [],
-            "total": 0,
-            "error": f"API request failed: {exc}",
-            "url": url,
-        }
-    except ValueError as exc:
-        return {
-            "ok": False,
-            "records": [],
-            "total": 0,
-            "error": f"Invalid JSON response from API: {exc}",
-            "url": url,
-        }
 
 
 def search_with_filter_fallback(
@@ -199,15 +142,15 @@ def records_to_display_df(records: list[dict[str, Any]]) -> pd.DataFrame:
     df = pd.json_normalize(records, sep=".")
     for column in df.columns:
         if df[column].dtype == object:
-            df[column] = df[column].map(_stringify_for_table)
+            df[column] = df[column].map(stringify_for_table)
     return df
 
 
 def records_to_analysis_df(records: list[dict[str, Any]]) -> tuple[pd.DataFrame, str | None]:
     rows: list[dict[str, Any]] = []
     for record in records:
-        publisher = _to_text(record.get("publisher"))
-        supplier = _to_text(
+        publisher = safe_text(record.get("publisher"))
+        supplier = safe_text(
             record.get("supplier_name")
             or record.get("recipient")
             or record.get("entity_name")
@@ -217,8 +160,8 @@ def records_to_analysis_df(records: list[dict[str, Any]]) -> tuple[pd.DataFrame,
             {
                 "publisher": publisher,
                 "supplier": supplier,
-                "executed": _to_number(record.get("executed")),
-                "volume": _to_number(record.get("volume")),
+                "executed": safe_number(record.get("executed")),
+                "volume": safe_number(record.get("volume")),
                 "order_date": pd.to_datetime(record.get("order_date"), errors="coerce"),
             }
         )
@@ -256,7 +199,7 @@ def generate_insights(
     if metric_col:
         total_metric = analysis_df[metric_col].fillna(0).sum()
         insights.append(
-            f"Total {metric_col} in current page: {_human_number(total_metric)}."
+            f"Total {metric_col} in current page: {human_number(total_metric)}."
         )
 
     publishers = analysis_df.loc[
@@ -282,7 +225,7 @@ def generate_insights(
             top_publisher = by_pub.index[0]
             top_value = by_pub.iloc[0]
             insights.append(
-                f"Top publisher by {metric_col}: {top_publisher} ({_human_number(top_value)})."
+                f"Top publisher by {metric_col}: {top_publisher} ({human_number(top_value)})."
             )
 
     valid_dates = analysis_df["order_date"].dropna()
@@ -298,7 +241,7 @@ def generate_insights(
     return insights[:6]
 
 
-def _placeholder_chart(title: str, message: str) -> plt.Figure:
+def placeholder_chart(title: str, message: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(9, 4.5))
     ax.axis("off")
     ax.set_title(title)
@@ -310,7 +253,6 @@ def _placeholder_chart(title: str, message: str) -> plt.Figure:
 def create_charts(analysis_df: pd.DataFrame, metric_col: str | None) -> dict[str, plt.Figure]:
     charts: dict[str, plt.Figure] = {}
 
-    # Chart A: Top 10 publishers by executed (fallback volume)
     publisher_title = "Top 10 Publishers by Executed (fallback: Volume)"
     if not analysis_df.empty:
         publisher_df = analysis_df.loc[
@@ -344,11 +286,10 @@ def create_charts(analysis_df: pd.DataFrame, metric_col: str | None) -> dict[str
         fig.tight_layout()
         charts["publishers"] = fig
     else:
-        charts["publishers"] = _placeholder_chart(
+        charts["publishers"] = placeholder_chart(
             publisher_title, "No publisher data available for this result set."
         )
 
-    # Chart B: Top 10 suppliers by executed/volume
     supplier_title = "Top 10 Suppliers by Executed/Volume"
     if not analysis_df.empty:
         supplier_df = analysis_df.loc[
@@ -382,11 +323,10 @@ def create_charts(analysis_df: pd.DataFrame, metric_col: str | None) -> dict[str
         fig.tight_layout()
         charts["suppliers"] = fig
     else:
-        charts["suppliers"] = _placeholder_chart(
+        charts["suppliers"] = placeholder_chart(
             supplier_title, "No supplier/recipient data available for this result set."
         )
 
-    # Chart C: Monthly time series if order_date exists
     monthly_title = "Monthly Time Series"
     if not analysis_df.empty:
         time_df = analysis_df.dropna(subset=["order_date"]).copy()
@@ -409,42 +349,14 @@ def create_charts(analysis_df: pd.DataFrame, metric_col: str | None) -> dict[str
         fig.tight_layout()
         charts["monthly"] = fig
     else:
-        charts["monthly"] = _placeholder_chart(
+        charts["monthly"] = placeholder_chart(
             monthly_title, "No valid order_date values available for this result set."
         )
 
     return charts
 
 
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="results")
-    output.seek(0)
-    return output.getvalue()
-
-
-def figure_to_png_bytes(fig: plt.Figure) -> bytes:
-    output = io.BytesIO()
-    fig.savefig(output, format="png", dpi=150, bbox_inches="tight")
-    output.seek(0)
-    return output.getvalue()
-
-
-def charts_to_zip_bytes(charts: dict[str, plt.Figure], prefix: str) -> bytes:
-    output = io.BytesIO()
-    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, fig in charts.items():
-            archive.writestr(f"{prefix}_{name}.png", figure_to_png_bytes(fig))
-    output.seek(0)
-    return output.getvalue()
-
-
-def publisher_suggestions(analysis_df: pd.DataFrame) -> pd.DataFrame:
+def publisher_suggestions_single(analysis_df: pd.DataFrame) -> pd.DataFrame:
     if analysis_df.empty:
         return pd.DataFrame(columns=["publisher", "rows"])
     counts = (
@@ -469,7 +381,7 @@ def render_result_panel(panel_title: str, result: dict[str, Any], download_key_p
     st.caption(f"API URL: {result.get('url', '')}")
 
     records = result.get("records", [])
-    total = _safe_int(result.get("total"), 0)
+    total = safe_int(result.get("total"), 0)
     display_df = records_to_display_df(records)
     analysis_df, metric_col = records_to_analysis_df(records)
     charts = create_charts(analysis_df, metric_col)
@@ -490,8 +402,12 @@ def render_result_panel(panel_title: str, result: dict[str, Any], download_key_p
     st.dataframe(display_df, use_container_width=True)
 
     csv_bytes = dataframe_to_csv_bytes(display_df)
-    excel_bytes = dataframe_to_excel_bytes(display_df)
-    charts_zip_bytes = charts_to_zip_bytes(charts, prefix=download_key_prefix)
+    excel_bytes = dataframe_to_excel_bytes(display_df, sheet_name="results")
+
+    chart_bytes = {}
+    for name, fig in charts.items():
+        chart_bytes[name] = figure_to_png_bytes(fig)
+        plt.close(fig)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -507,52 +423,440 @@ def render_result_panel(panel_title: str, result: dict[str, Any], download_key_p
             "Download Excel (XLSX)",
             data=excel_bytes,
             file_name=f"{download_key_prefix}.xlsx",
-            mime=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ),
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"{download_key_prefix}_xlsx",
         )
     with col3:
+        charts_zip_payload = build_report_bundle_zip(
+            report_xlsx_bytes=excel_bytes,
+            raw_csv_bytes={f"{download_key_prefix}.csv": csv_bytes},
+            raw_xlsx_bytes={},
+            chart_png_bytes={
+                f"{download_key_prefix}_{name}.png": payload
+                for name, payload in chart_bytes.items()
+            },
+            report_md="Charts bundle for single-query mode.",
+        )
         st.download_button(
             "Download PNG charts (ZIP)",
-            data=charts_zip_bytes,
+            data=charts_zip_payload,
             file_name=f"{download_key_prefix}_charts.zip",
             mime="application/zip",
             key=f"{download_key_prefix}_png",
         )
 
     st.markdown("**Charts**")
-    st.pyplot(charts["publishers"])
-    st.pyplot(charts["suppliers"])
-    st.pyplot(charts["monthly"])
+    st.image(chart_bytes["publishers"], caption="Top publishers chart", use_container_width=True)
+    st.image(chart_bytes["suppliers"], caption="Top suppliers chart", use_container_width=True)
+    st.image(chart_bytes["monthly"], caption="Monthly time series chart", use_container_width=True)
 
-    for fig in charts.values():
+
+def build_report_markdown(
+    query_params: dict[str, Any],
+    insights: list[str],
+    no_data_hps: list[str],
+    cap_events: list[dict[str, Any]],
+) -> str:
+    lines = [
+        "# BudgetKey Bulk Management Report",
+        "",
+        "## Query Parameters Used",
+    ]
+    for key, value in query_params.items():
+        lines.append(f"- **{key}**: {value}")
+
+    lines.append("")
+    lines.append("## Main Insights")
+    for index, insight in enumerate(insights, start=1):
+        lines.append(f"{index}. {insight}")
+
+    lines.append("")
+    lines.append("## HPs With No Data")
+    if no_data_hps:
+        for hp in no_data_hps:
+            lines.append(f"- {hp}")
+    else:
+        lines.append("- None")
+
+    lines.append("")
+    lines.append("## Cap Warnings")
+    if cap_events:
+        for event in cap_events:
+            lines.append(
+                f"- HP {event['hp']} / {event['doc_type']} hit cap {event['row_cap']} "
+                f"(fetched_raw_rows={event['fetched_raw_rows']})."
+            )
+    else:
+        lines.append("- No cap warnings.")
+
+    return "\n".join(lines)
+
+
+def run_bulk_pull(
+    normalized_hp_df: pd.DataFrame,
+    selected_doc_types: list[str],
+    years: list[int],
+    publisher_filter: str,
+    keyword: str,
+    page_size: int,
+    row_cap: int,
+    max_workers: int,
+) -> dict[str, Any]:
+    progress = st.progress(0.0, text="Starting bulk pull...")
+    status_placeholder = st.empty()
+
+    status_rows: list[dict[str, Any]] = []
+    cap_events: list[dict[str, Any]] = []
+    records_map: dict[str, list[dict[str, Any]]] = {
+        "contract-spending": [],
+        "supports": [],
+        "entities": [],
+    }
+
+    future_map: dict[Any, tuple[str, str]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for _, row in normalized_hp_df.iterrows():
+            hp = str(row["hp"])
+            company_name = str(row.get("company_name", ""))
+            future = executor.submit(
+                process_single_hp,
+                hp=hp,
+                company_name=company_name,
+                selected_doc_types=selected_doc_types,
+                years=years,
+                publisher_filter=publisher_filter,
+                keyword=keyword,
+                page_size=page_size,
+                row_cap=row_cap,
+            )
+            future_map[future] = (hp, company_name)
+
+        total_hps = len(future_map)
+        completed = 0
+        for future in as_completed(future_map):
+            hp, company_name = future_map[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "hp": hp,
+                    "company_name": company_name,
+                    "overall_status": "error",
+                    "doc_results": {
+                        doc_type: {
+                            "status": "error",
+                            "records": [],
+                            "error": f"Unexpected worker error: {exc}",
+                            "capped": False,
+                            "fetched_raw_rows": 0,
+                            "total_available": 0,
+                        }
+                        for doc_type in selected_doc_types
+                    },
+                }
+
+            row_status = {
+                "hp": result.get("hp", hp),
+                "company_name": result.get("company_name", company_name),
+                "overall_status": result.get("overall_status", "error"),
+            }
+
+            for doc_type in selected_doc_types:
+                doc_result = result.get("doc_results", {}).get(doc_type, {})
+                doc_records = doc_result.get("records", [])
+                records_map[doc_type].extend(doc_records)
+
+                row_status[f"{doc_type}_status"] = doc_result.get("status", "error")
+                row_status[f"{doc_type}_rows"] = len(doc_records)
+                row_status[f"{doc_type}_error"] = doc_result.get("error", "")
+
+                if doc_result.get("capped", False):
+                    cap_events.append(
+                        {
+                            "hp": result.get("hp", hp),
+                            "doc_type": doc_type,
+                            "row_cap": row_cap,
+                            "fetched_raw_rows": doc_result.get("fetched_raw_rows", 0),
+                        }
+                    )
+
+            status_rows.append(row_status)
+            completed += 1
+            progress.progress(
+                completed / total_hps,
+                text=f"Processed {completed}/{total_hps} HP values",
+            )
+
+            status_df_partial = pd.DataFrame(status_rows).sort_values("hp")
+            status_placeholder.dataframe(status_df_partial, use_container_width=True)
+
+    status_df = pd.DataFrame(status_rows).sort_values("hp") if status_rows else pd.DataFrame()
+
+    contract_df = ensure_output_columns(
+        records_to_dataframe_bulk(records_map.get("contract-spending", []))
+    )
+    supports_df = ensure_output_columns(
+        records_to_dataframe_bulk(records_map.get("supports", []))
+    )
+    entities_df = ensure_output_columns(records_to_dataframe_bulk(records_map.get("entities", [])))
+    master_df = build_master_joined_table(contract_df, supports_df, entities_df)
+
+    summary = compute_management_summary(
+        contract_df=contract_df,
+        supports_df=supports_df,
+        entities_df=entities_df,
+        status_df=status_df,
+        selected_doc_types=selected_doc_types,
+    )
+
+    chart_figures = create_management_charts(contract_df, supports_df)
+    chart_png_bytes = {
+        f"{name}.png": figure_to_png_bytes(fig) for name, fig in chart_figures.items()
+    }
+    for fig in chart_figures.values():
         plt.close(fig)
+
+    query_params = {
+        "selected_doc_types": ", ".join(selected_doc_types),
+        "years": ", ".join(str(year) for year in years) if years else "all",
+        "publisher_filter": publisher_filter or "None",
+        "keyword": keyword or "None",
+        "page_size": str(page_size),
+        "row_cap_per_doc_type_per_hp": str(row_cap),
+        "max_workers": str(max_workers),
+        "input_hp_count": str(len(normalized_hp_df)),
+        "run_date": str(date.today()),
+    }
+
+    report_md = build_report_markdown(
+        query_params=query_params,
+        insights=summary.get("insights", []),
+        no_data_hps=summary.get("no_data_hps", []),
+        cap_events=cap_events,
+    )
+
+    raw_csv_map = {
+        "contract_spending_raw.csv": dataframe_to_csv_bytes(contract_df),
+        "supports_raw.csv": dataframe_to_csv_bytes(supports_df),
+    }
+    raw_xlsx_map = {
+        "contract_spending_raw.xlsx": dataframe_to_excel_bytes(
+            contract_df, sheet_name="contract_spending_raw"
+        ),
+        "supports_raw.xlsx": dataframe_to_excel_bytes(
+            supports_df, sheet_name="supports_raw"
+        ),
+    }
+    if "entities" in selected_doc_types:
+        raw_csv_map["entities_lookup.csv"] = dataframe_to_csv_bytes(entities_df)
+        raw_xlsx_map["entities_lookup.xlsx"] = dataframe_to_excel_bytes(
+            entities_df, sheet_name="entities_lookup"
+        )
+
+    combined_xlsx_bytes = build_combined_report_xlsx(
+        executive_summary_df=summary["executive_summary_df"],
+        contract_df=contract_df,
+        supports_df=supports_df,
+        entities_df=entities_df,
+        insights=summary["insights"],
+        query_params={k: str(v) for k, v in query_params.items()},
+        include_entities_sheet=("entities" in selected_doc_types),
+        chart_file_names=sorted(chart_png_bytes.keys()),
+    )
+
+    report_bundle_bytes = build_report_bundle_zip(
+        report_xlsx_bytes=combined_xlsx_bytes,
+        raw_csv_bytes=raw_csv_map,
+        raw_xlsx_bytes=raw_xlsx_map,
+        chart_png_bytes=chart_png_bytes,
+        report_md=report_md,
+    )
+
+    publisher_suggestions = publisher_suggestions_from_results(contract_df, top_n=20)
+
+    return {
+        "status_df": status_df,
+        "contract_df": contract_df,
+        "supports_df": supports_df,
+        "entities_df": entities_df,
+        "master_df": master_df,
+        "summary": summary,
+        "query_params": query_params,
+        "cap_events": cap_events,
+        "chart_png_bytes": chart_png_bytes,
+        "raw_csv_map": raw_csv_map,
+        "raw_xlsx_map": raw_xlsx_map,
+        "combined_xlsx_bytes": combined_xlsx_bytes,
+        "report_bundle_bytes": report_bundle_bytes,
+        "report_md": report_md,
+        "publisher_suggestions": publisher_suggestions,
+    }
+
+
+def render_bulk_results(result: dict[str, Any]) -> None:
+    summary = result["summary"]
+    kpis = summary["kpis"]
+
+    st.subheader("Management Summary")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Contract records", f"{kpis['contract_spending_records']:,}")
+    col2.metric("Supports records", f"{kpis['supports_records']:,}")
+    col3.metric("Entities records", f"{kpis['entities_records']:,}")
+
+    col4, col5, col6 = st.columns(3)
+    col4.metric("Contract total amount", human_number(kpis["contract_total_amount"]))
+    col5.metric(
+        "Supports total amount_total", human_number(kpis["supports_total_amount_total"])
+    )
+    col6.metric(
+        "Unique suppliers / recipients",
+        f"{kpis['unique_suppliers']:,} / {kpis['unique_recipients']:,}",
+    )
+
+    st.markdown("**Insights (Executive)**")
+    for insight in summary["insights"]:
+        st.markdown(f"- {insight}")
+
+    no_data_hps = summary.get("no_data_hps", [])
+    st.markdown("**HPs with no data**")
+    if no_data_hps:
+        st.write(", ".join(no_data_hps))
+    else:
+        st.write("None")
+
+    if result["cap_events"]:
+        st.warning(
+            "Some HP/doc-type pulls hit the configured row cap. See details below."
+        )
+        st.dataframe(pd.DataFrame(result["cap_events"]), use_container_width=True)
+
+    st.markdown("### Charts")
+    st.image(
+        result["chart_png_bytes"]["top_publishers_by_amount.png"],
+        caption="Top 10 publishers by amount",
+        use_container_width=True,
+    )
+    st.image(
+        result["chart_png_bytes"]["top_suppliers_by_amount.png"],
+        caption="Top 10 suppliers by amount",
+        use_container_width=True,
+    )
+    st.image(
+        result["chart_png_bytes"]["top_purposes_by_count.png"],
+        caption="Top 10 purposes by count",
+        use_container_width=True,
+    )
+    st.image(
+        result["chart_png_bytes"]["amount_time_series.png"],
+        caption="Amount over time",
+        use_container_width=True,
+    )
+
+    st.markdown("### Per-HP Status")
+    st.dataframe(result["status_df"], use_container_width=True)
+
+    st.markdown("### Combined Results by Doc-Type")
+    st.markdown("**contract-spending**")
+    st.dataframe(result["contract_df"], use_container_width=True)
+    st.markdown("**supports**")
+    st.dataframe(result["supports_df"], use_container_width=True)
+    st.markdown("**entities lookup**")
+    st.dataframe(result["entities_df"], use_container_width=True)
+
+    st.markdown("### Master Joined Table")
+    st.dataframe(result["master_df"], use_container_width=True)
+
+    st.markdown("### Downloads")
+    raw_col1, raw_col2 = st.columns(2)
+    with raw_col1:
+        st.download_button(
+            "Download contract-spending CSV",
+            data=result["raw_csv_map"]["contract_spending_raw.csv"],
+            file_name="contract_spending_raw.csv",
+            mime="text/csv",
+            key="bulk_contract_csv",
+        )
+        st.download_button(
+            "Download supports CSV",
+            data=result["raw_csv_map"]["supports_raw.csv"],
+            file_name="supports_raw.csv",
+            mime="text/csv",
+            key="bulk_supports_csv",
+        )
+        if "entities_lookup.csv" in result["raw_csv_map"]:
+            st.download_button(
+                "Download entities CSV",
+                data=result["raw_csv_map"]["entities_lookup.csv"],
+                file_name="entities_lookup.csv",
+                mime="text/csv",
+                key="bulk_entities_csv",
+            )
+    with raw_col2:
+        st.download_button(
+            "Download contract-spending XLSX",
+            data=result["raw_xlsx_map"]["contract_spending_raw.xlsx"],
+            file_name="contract_spending_raw.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="bulk_contract_xlsx",
+        )
+        st.download_button(
+            "Download supports XLSX",
+            data=result["raw_xlsx_map"]["supports_raw.xlsx"],
+            file_name="supports_raw.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="bulk_supports_xlsx",
+        )
+        if "entities_lookup.xlsx" in result["raw_xlsx_map"]:
+            st.download_button(
+                "Download entities XLSX",
+                data=result["raw_xlsx_map"]["entities_lookup.xlsx"],
+                file_name="entities_lookup.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="bulk_entities_xlsx",
+            )
+
+    st.download_button(
+        "Download Combined XLSX Report",
+        data=result["combined_xlsx_bytes"],
+        file_name="budgetkey_bulk_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="bulk_combined_xlsx",
+    )
+
+    st.download_button(
+        "Download Report Bundle (ZIP)",
+        data=result["report_bundle_bytes"],
+        file_name="budgetkey_report_bundle.zip",
+        mime="application/zip",
+        key="bulk_bundle_zip",
+    )
 
 
 st.set_page_config(page_title="BudgetKey Team App", layout="wide")
 st.title("BudgetKey Team App (Streamlit)")
 st.write(
     "Search BudgetKey public data by registration number (ח.פ.), use of money, "
-    "or ministry/publisher."
+    "ministry/publisher, or run bulk Excel extraction for team reporting."
 )
 
 with st.sidebar:
-    st.header("Pagination")
+    st.header("Mode")
+    search_mode = st.radio(
+        "Choose mode",
+        (
+            "1) Search by registration number (ח.פ.)",
+            "2) Search by use of money",
+            "3) Search by ministry/publisher",
+            "4) Bulk Excel (ח.פ.)",
+        ),
+    )
+    st.divider()
+    st.header("Single-search pagination")
     size = st.number_input("size", min_value=1, max_value=500, value=50, step=10)
     from_offset = st.number_input("from", min_value=0, max_value=1_000_000, value=0, step=50)
     if st.button("Clear cached API responses"):
         st.cache_data.clear()
         st.success("Cache cleared.")
-
-search_mode = st.radio(
-    "Choose search mode",
-    (
-        "1) Search by registration number (ח.פ.)",
-        "2) Search by use of money",
-        "3) Search by ministry/publisher",
-    ),
-)
 
 if search_mode.startswith("1"):
     hp_value = st.text_input("Registration number (ח.פ.)", key="hp_input")
@@ -655,7 +959,7 @@ elif search_mode.startswith("2"):
             purpose_results["result"],
             "purpose_contract_spending",
         )
-        suggestions_df = publisher_suggestions(
+        suggestions_df = publisher_suggestions_single(
             records_to_analysis_df(purpose_results["result"].get("records", []))[0]
         )
         st.markdown("**Publisher suggestions from current results**")
@@ -664,7 +968,7 @@ elif search_mode.startswith("2"):
         else:
             st.dataframe(suggestions_df, use_container_width=True)
 
-else:
+elif search_mode.startswith("3"):
     ministry_query = st.text_input("Ministry / publisher", key="ministry_query_input")
     if st.button("Run ministry/publisher search", type="primary"):
         publisher = ministry_query.strip()
@@ -696,7 +1000,7 @@ else:
             ministry_results["result"],
             "ministry_contract_spending",
         )
-        suggestions_df = publisher_suggestions(
+        suggestions_df = publisher_suggestions_single(
             records_to_analysis_df(ministry_results["result"].get("records", []))[0]
         )
         st.markdown("**Publisher suggestions from current results**")
@@ -704,3 +1008,129 @@ else:
             st.caption("No publisher suggestions available for this page.")
         else:
             st.dataframe(suggestions_df, use_container_width=True)
+
+else:
+    st.subheader("Bulk Excel (ח.פ.)")
+    st.write(
+        "Upload an Excel file with HP column and pull contract/support/entity data in bulk "
+        "with pagination, concurrency, and full report exports."
+    )
+    uploaded_file = st.file_uploader(
+        "Upload Excel (.xlsx)",
+        type=["xlsx"],
+        help=(
+            "Required HP column auto-detected from: ח.פ / חפ / HP / registration / company_id. "
+            "Optional company name column: חברה / company_name / name."
+        ),
+    )
+
+    selected_doc_types: list[str] = []
+    st.markdown("**Doc-types to fetch**")
+    contract_checked = st.checkbox("contract-spending", value=True)
+    supports_checked = st.checkbox("supports", value=True)
+    entities_checked = st.checkbox("entities (lookup)", value=False)
+    if contract_checked:
+        selected_doc_types.append("contract-spending")
+    if supports_checked:
+        selected_doc_types.append("supports")
+    if entities_checked:
+        selected_doc_types.append("entities")
+
+    year_options = list(range(2018, 2027))
+    years_selected = st.multiselect(
+        "Years filter",
+        options=year_options,
+        default=[2021, 2022, 2023],
+        help=(
+            "contract-spending filtered by order_date year; "
+            "supports filtered by year_requested."
+        ),
+    )
+
+    publisher_suggestions = st.session_state.get("bulk_publisher_suggestions", [])
+    suggested_publisher = st.selectbox(
+        "Publisher suggestion (optional)",
+        options=[""] + publisher_suggestions,
+        index=0,
+    )
+    publisher_text = st.text_input(
+        "Ministry/Publisher filter (optional)",
+        help="Best-effort server filter via filters JSON; fallback behavior still applied.",
+    )
+    publisher_filter = publisher_text.strip() or suggested_publisher.strip()
+
+    keyword = st.text_input(
+        "Use-of-money keyword (optional)",
+        help=(
+            "contract-spending keyword against purpose/description; "
+            "supports keyword against recipient/program text."
+        ),
+    ).strip()
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        page_size = st.number_input(
+            "Page size per request",
+            min_value=10,
+            max_value=500,
+            value=100,
+            step=10,
+        )
+    with col_b:
+        row_cap = st.number_input(
+            "Row cap per doc-type per HP",
+            min_value=100,
+            max_value=10000,
+            value=2000,
+            step=100,
+        )
+    with col_c:
+        max_workers = st.number_input(
+            "Thread workers",
+            min_value=1,
+            max_value=20,
+            value=5,
+            step=1,
+        )
+
+    normalized_hp_df = pd.DataFrame()
+    if uploaded_file is not None:
+        try:
+            uploaded_df = pd.read_excel(uploaded_file)
+            normalized_hp_df, hp_col_name, name_col_name = normalize_uploaded_dataframe(uploaded_df)
+            st.success(
+                "Detected HP column: "
+                f"'{hp_col_name}'"
+                + (f", company name column: '{name_col_name}'." if name_col_name else ".")
+            )
+            st.caption(f"Normalized HP rows: {len(normalized_hp_df):,}")
+            st.dataframe(normalized_hp_df.head(50), use_container_width=True)
+        except Exception as exc:
+            st.error(f"Failed to parse uploaded Excel: {exc}")
+
+    if st.button("Run Bulk Pull", type="primary"):
+        if uploaded_file is None:
+            st.warning("Please upload an Excel file first.")
+        elif normalized_hp_df.empty:
+            st.warning("No valid HP rows found after normalization.")
+        elif not selected_doc_types:
+            st.warning("Please select at least one doc-type.")
+        else:
+            with st.spinner("Running bulk extraction... this may take a while for many HPs."):
+                bulk_result = run_bulk_pull(
+                    normalized_hp_df=normalized_hp_df,
+                    selected_doc_types=selected_doc_types,
+                    years=sorted(int(year) for year in years_selected),
+                    publisher_filter=publisher_filter,
+                    keyword=keyword,
+                    page_size=int(page_size),
+                    row_cap=int(row_cap),
+                    max_workers=int(max_workers),
+                )
+            st.session_state["bulk_result"] = bulk_result
+            st.session_state["bulk_publisher_suggestions"] = bulk_result["publisher_suggestions"]
+            st.success("Bulk pull completed.")
+
+    bulk_result = st.session_state.get("bulk_result")
+    if bulk_result:
+        render_bulk_results(bulk_result)
