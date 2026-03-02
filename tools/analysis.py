@@ -57,7 +57,9 @@ def _coalesce_text_columns(df: pd.DataFrame, candidates: list[str]) -> pd.Series
     return result
 
 
-def build_procurement_df(contract_df: pd.DataFrame) -> pd.DataFrame:
+def build_procurement_df(
+    contract_df: pd.DataFrame, keep_extra_columns: bool = True
+) -> pd.DataFrame:
     required_columns = [
         "שנה",
         "תקנה תקציבית",
@@ -129,7 +131,22 @@ def build_procurement_df(contract_df: pd.DataFrame) -> pd.DataFrame:
     output = output.sort_values(
         by=["_sort_year", "סך כולל"], ascending=[False, False]
     ).drop(columns=["_sort_year"])
-    return output.reset_index(drop=True)
+    output = output.reset_index(drop=True)
+    if not keep_extra_columns:
+        keep_cols = [
+            "שנה",
+            "תקנה תקציבית",
+            "משרד",
+            "סך כולל",
+            "תיאור",
+            "מול מי ההתקשרות",
+            "סוג ההוצאה",
+            "_purpose_base",
+            "_missing_amount",
+        ]
+        keep_cols = [col for col in keep_cols if col in output.columns]
+        output = output[keep_cols]
+    return output
 
 
 def build_master_joined_table(

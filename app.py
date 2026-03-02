@@ -462,7 +462,7 @@ def render_procurement_view(
     st.markdown("### Procurement view (רכש)")
     st.write("רשימת התקשרויות רכש: על מה הייתה ההוצאה ומול מי ההתקשרות")
 
-    procurement_df = build_procurement_df(contract_df)
+    procurement_df = build_procurement_df(contract_df, keep_extra_columns=True)
     if procurement_df.empty:
         st.info("No contract-spending records available for procurement view.")
         return
@@ -584,7 +584,9 @@ def render_procurement_view(
     table_df = filtered[display_cols].copy()
     st.dataframe(table_df, use_container_width=True)
 
-    export_df = table_df.copy()
+    export_cols = required_cols + ["hp", "company_name", "תג אזהרה"]
+    export_cols = [col for col in export_cols if col in filtered.columns]
+    export_df = filtered[export_cols].copy()
     csv_bytes = dataframe_to_csv_bytes(export_df)
     excel_bytes = dataframe_to_excel_bytes(export_df, sheet_name="procurement_view")
     e_col1, e_col2 = st.columns(2)
@@ -656,6 +658,7 @@ def run_bulk_pull(
     page_size: int,
     row_cap: int,
     max_workers: int,
+    debug_requests: bool,
 ) -> dict[str, Any]:
     progress = st.progress(0.0, text="Starting bulk pull...")
     status_placeholder = st.empty()
@@ -687,6 +690,7 @@ def run_bulk_pull(
                 keyword=keyword,
                 page_size=page_size,
                 row_cap=row_cap,
+                debug_enabled=debug_requests,
             )
             future_map[future] = (hp, company_name)
 
@@ -710,6 +714,10 @@ def run_bulk_pull(
                             "fetched_raw_rows": 0,
                             "total_available": 0,
                             "debug_pages": [],
+                            "warning": "",
+                            "fetched_candidates_rows": 0,
+                            "local_matched_rows": 0,
+                            "unverified_rows": 0,
                         }
                         for doc_type in selected_doc_types
                     },
@@ -729,7 +737,15 @@ def run_bulk_pull(
                 row_status[f"{doc_type}_status"] = doc_result.get("status", "error")
                 row_status[f"{doc_type}_rows"] = len(doc_records)
                 row_status[f"{doc_type}_error"] = doc_result.get("error", "")
-                if result.get("hp", hp) == first_hp_value:
+                row_status[f"{doc_type}_warning"] = doc_result.get("warning", "")
+                row_status[f"{doc_type}_candidates"] = doc_result.get(
+                    "fetched_candidates_rows", 0
+                )
+                row_status[f"{doc_type}_matched"] = doc_result.get(
+                    "local_matched_rows", 0
+                )
+                row_status[f"{doc_type}_capped"] = bool(doc_result.get("capped", False))
+                if debug_requests and result.get("hp", hp) == first_hp_value:
                     first_hp_debug_pages.extend(doc_result.get("debug_pages", []))
 
                 if doc_result.get("capped", False):
@@ -856,6 +872,7 @@ def run_bulk_pull(
             "hp": first_hp_value,
             "pages": first_hp_debug_pages,
         },
+        "debug_enabled": debug_requests,
     }
 
 
@@ -921,32 +938,55 @@ def render_bulk_results(result: dict[str, Any]) -> None:
     st.markdown("### Per-HP Status")
     st.dataframe(result["status_df"], use_container_width=True)
 
-    first_hp_debug = result.get("first_hp_debug", {})
-    with st.expander("Debug panel (first HP requests)", expanded=False):
-        st.markdown(
-            "Shows exact request URLs and hits/page for first uploaded HP."
-        )
-        st.write(f"First HP: {first_hp_debug.get('hp', '')}")
-        debug_pages = first_hp_debug.get("pages", [])
-        if debug_pages:
-            debug_df = pd.DataFrame(debug_pages)
-            debug_cols = [
-                "doc_type",
-                "server_strategy",
-                "q",
-                "filters",
-                "size",
-                "from",
-                "hits_returned",
-                "total_available",
-                "url",
-                "ok",
-                "error",
-            ]
-            debug_cols = [col for col in debug_cols if col in debug_df.columns]
-            st.dataframe(debug_df[debug_cols], use_container_width=True)
-        else:
-            st.caption("No debug pages captured for the first HP.")
+    status_df = result.get("status_df", pd.DataFrame())
+    if not status_df.empty and "contract-spending_warning" in status_df.columns:
+        contract_warn_df = status_df.loc[
+            status_df["contract-spending_warning"].astype(str).str.strip().ne(""),
+            [
+                col
+                for col in [
+                    "hp",
+                    "company_name",
+                    "contract-spending_warning",
+                    "contract-spending_candidates",
+                    "contract-spending_matched",
+                ]
+                if col in status_df.columns
+            ],
+        ]
+        if not contract_warn_df.empty:
+            st.warning("Some HP values had no contract-spending supplier_code matches.")
+            st.dataframe(contract_warn_df, use_container_width=True)
+
+    if result.get("debug_enabled", False):
+        first_hp_debug = result.get("first_hp_debug", {})
+        with st.expander("Debug panel (first HP requests)", expanded=False):
+            st.markdown(
+                "Shows exact request URLs, per-page hits, and local matched rows for first uploaded HP."
+            )
+            st.write(f"First HP: {first_hp_debug.get('hp', '')}")
+            debug_pages = first_hp_debug.get("pages", [])
+            if debug_pages:
+                debug_df = pd.DataFrame(debug_pages)
+                debug_cols = [
+                    "doc_type",
+                    "server_strategy",
+                    "q",
+                    "filters",
+                    "size",
+                    "from",
+                    "hits_returned",
+                    "local_matched_rows",
+                    "kept_after_filters",
+                    "total_available",
+                    "url",
+                    "ok",
+                    "error",
+                ]
+                debug_cols = [col for col in debug_cols if col in debug_df.columns]
+                st.dataframe(debug_df[debug_cols], use_container_width=True)
+            else:
+                st.caption("No debug pages captured for the first HP.")
 
     render_procurement_view(
         contract_df=result["contract_df"],
@@ -1287,7 +1327,7 @@ else:
             "Row cap per doc-type per HP",
             min_value=100,
             max_value=10000,
-            value=2000,
+            value=5000,
             step=100,
         )
     with col_c:
@@ -1298,6 +1338,13 @@ else:
             value=5,
             step=1,
         )
+    debug_requests = st.checkbox(
+        "Debug requests (first HP)",
+        value=False,
+        help=(
+            "When enabled, shows first HP request params, per-page hits, and local matched counts."
+        ),
+    )
 
     normalized_hp_df = pd.DataFrame()
     if uploaded_file is not None:
@@ -1332,6 +1379,7 @@ else:
                     page_size=int(page_size),
                     row_cap=int(row_cap),
                     max_workers=int(max_workers),
+                    debug_requests=debug_requests,
                 )
             st.session_state["bulk_result"] = bulk_result
             st.session_state["bulk_publisher_suggestions"] = bulk_result["publisher_suggestions"]
