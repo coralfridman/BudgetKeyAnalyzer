@@ -31,6 +31,107 @@ def ensure_output_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def _as_text(value: Any) -> str:
+    if isinstance(value, list):
+        for item in value:
+            text = _as_text(item)
+            if text:
+                return text
+        return ""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none"}:
+        return ""
+    return text
+
+
+def _coalesce_text_columns(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    result = pd.Series([""] * len(df), index=df.index, dtype=object)
+    for column in candidates:
+        if column not in df.columns:
+            continue
+        values = df[column].map(_as_text)
+        fill_mask = result.eq("") & values.ne("")
+        result.loc[fill_mask] = values.loc[fill_mask]
+    return result
+
+
+def build_procurement_df(contract_df: pd.DataFrame) -> pd.DataFrame:
+    required_columns = [
+        "שנה",
+        "תקנה תקציבית",
+        "משרד",
+        "סך כולל",
+        "תיאור",
+        "מול מי ההתקשרות",
+        "סוג ההוצאה",
+    ]
+    detail_columns = ["hp", "company_name", "תג אזהרה", "_purpose_base", "_missing_amount"]
+
+    if contract_df.empty:
+        return pd.DataFrame(columns=required_columns + detail_columns)
+
+    work = contract_df.copy()
+
+    executed = pd.to_numeric(work.get("executed", pd.Series(index=work.index)), errors="coerce")
+    volume = pd.to_numeric(work.get("volume", pd.Series(index=work.index)), errors="coerce")
+    amount = executed.where(executed.notna(), volume)
+    missing_amount_mask = amount.isna()
+    amount = amount.fillna(0)
+
+    order_date_series = pd.to_datetime(
+        work.get("order_date", pd.Series(index=work.index, dtype=object)),
+        errors="coerce",
+    )
+    year_series = order_date_series.dt.year.astype("Int64")
+
+    budget_code = _coalesce_text_columns(work, ["budget_code"])
+    publisher = _coalesce_text_columns(work, ["publisher"])
+    purpose_base = _coalesce_text_columns(
+        work, ["purpose", "description", "title", "page_title", "budget_title"]
+    )
+    supplier_name = _coalesce_text_columns(work, ["supplier_name", "supplier", "entity_name"])
+    expense_type = _coalesce_text_columns(work, ["expense_type", "spending_type", "type", "kind"])
+    expense_type = expense_type.mask(expense_type.eq(""), "רכש")
+    expense_type = expense_type.where(~missing_amount_mask, expense_type + " ⚠")
+
+    hp_values = (
+        work["hp"].map(_as_text)
+        if "hp" in work.columns
+        else pd.Series([""] * len(work), index=work.index, dtype=object)
+    )
+    company_values = (
+        work["company_name"].map(_as_text)
+        if "company_name" in work.columns
+        else pd.Series([""] * len(work), index=work.index, dtype=object)
+    )
+    warning_tag = missing_amount_mask.map(lambda is_missing: "⚠ חסר executed/volume" if is_missing else "")
+
+    output = pd.DataFrame(
+        {
+            "שנה": year_series,
+            "תקנה תקציבית": budget_code,
+            "משרד": publisher,
+            "סך כולל": amount.astype(float),
+            "תיאור": purpose_base,
+            "מול מי ההתקשרות": supplier_name,
+            "סוג ההוצאה": expense_type,
+            "hp": hp_values,
+            "company_name": company_values,
+            "תג אזהרה": warning_tag,
+            "_purpose_base": purpose_base,
+            "_missing_amount": missing_amount_mask,
+        }
+    )
+
+    output["_sort_year"] = output["שנה"].fillna(-1).astype(int)
+    output = output.sort_values(
+        by=["_sort_year", "סך כולל"], ascending=[False, False]
+    ).drop(columns=["_sort_year"])
+    return output.reset_index(drop=True)
+
+
 def build_master_joined_table(
     contract_df: pd.DataFrame, supports_df: pd.DataFrame, entities_df: pd.DataFrame
 ) -> pd.DataFrame:
