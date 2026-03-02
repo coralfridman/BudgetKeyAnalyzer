@@ -72,7 +72,11 @@ def _value_matches_filter(value: Any, expected: str, field_name: str) -> bool:
     if value is None:
         return False
     if field_name in {"supplier_code", "entity_id"}:
-        return digits_only(value) == digits_only(expected)
+        left = digits_only(value)
+        right = digits_only(expected)
+        left_norm = left.lstrip("0") or "0" if left else ""
+        right_norm = right.lstrip("0") or "0" if right else ""
+        return left_norm == right_norm
     return expected.casefold() in str(value).casefold()
 
 
@@ -504,6 +508,10 @@ def run_bulk_pull(
 ) -> dict[str, Any]:
     progress = st.progress(0.0, text="Starting bulk pull...")
     status_placeholder = st.empty()
+    first_hp_value = (
+        str(normalized_hp_df.iloc[0]["hp"]) if not normalized_hp_df.empty else ""
+    )
+    first_hp_debug_pages: list[dict[str, Any]] = []
 
     status_rows: list[dict[str, Any]] = []
     cap_events: list[dict[str, Any]] = []
@@ -550,6 +558,7 @@ def run_bulk_pull(
                             "capped": False,
                             "fetched_raw_rows": 0,
                             "total_available": 0,
+                            "debug_pages": [],
                         }
                         for doc_type in selected_doc_types
                     },
@@ -569,6 +578,8 @@ def run_bulk_pull(
                 row_status[f"{doc_type}_status"] = doc_result.get("status", "error")
                 row_status[f"{doc_type}_rows"] = len(doc_records)
                 row_status[f"{doc_type}_error"] = doc_result.get("error", "")
+                if result.get("hp", hp) == first_hp_value:
+                    first_hp_debug_pages.extend(doc_result.get("debug_pages", []))
 
                 if doc_result.get("capped", False):
                     cap_events.append(
@@ -690,6 +701,10 @@ def run_bulk_pull(
         "report_bundle_bytes": report_bundle_bytes,
         "report_md": report_md,
         "publisher_suggestions": publisher_suggestions,
+        "first_hp_debug": {
+            "hp": first_hp_value,
+            "pages": first_hp_debug_pages,
+        },
     }
 
 
@@ -754,6 +769,33 @@ def render_bulk_results(result: dict[str, Any]) -> None:
 
     st.markdown("### Per-HP Status")
     st.dataframe(result["status_df"], use_container_width=True)
+
+    first_hp_debug = result.get("first_hp_debug", {})
+    with st.expander("Debug panel (first HP requests)", expanded=False):
+        st.markdown(
+            "Shows exact request URLs and hits/page for first uploaded HP."
+        )
+        st.write(f"First HP: {first_hp_debug.get('hp', '')}")
+        debug_pages = first_hp_debug.get("pages", [])
+        if debug_pages:
+            debug_df = pd.DataFrame(debug_pages)
+            debug_cols = [
+                "doc_type",
+                "server_strategy",
+                "q",
+                "filters",
+                "size",
+                "from",
+                "hits_returned",
+                "total_available",
+                "url",
+                "ok",
+                "error",
+            ]
+            debug_cols = [col for col in debug_cols if col in debug_df.columns]
+            st.dataframe(debug_df[debug_cols], use_container_width=True)
+        else:
+            st.caption("No debug pages captured for the first HP.")
 
     st.markdown("### Combined Results by Doc-Type")
     st.markdown("**contract-spending**")
@@ -1096,7 +1138,7 @@ else:
     normalized_hp_df = pd.DataFrame()
     if uploaded_file is not None:
         try:
-            uploaded_df = pd.read_excel(uploaded_file)
+            uploaded_df = pd.read_excel(uploaded_file, dtype=str, keep_default_na=False)
             normalized_hp_df, hp_col_name, name_col_name = normalize_uploaded_dataframe(uploaded_df)
             st.success(
                 "Detected HP column: "
