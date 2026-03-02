@@ -47,13 +47,16 @@ def normalize_uploaded_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, str, s
 
     name_column = detect_name_column([str(col) for col in df.columns])
     normalized = pd.DataFrame()
-    normalized["hp"] = df[hp_column].map(digits_only)
+    normalized["hp"] = df[hp_column].map(digits_only).astype(str)
     normalized["company_name"] = (
         df[name_column].astype(str).where(df[name_column].notna(), "")
         if name_column
         else ""
     )
     normalized["company_name"] = normalized["company_name"].astype(str).str.strip()
+    normalized["company_name"] = normalized["company_name"].replace(
+        {"nan": "", "None": ""}
+    )
     normalized = normalized.loc[normalized["hp"].astype(str).str.strip().ne("")].copy()
     normalized = normalized.drop_duplicates(subset=["hp"]).reset_index(drop=True)
     return normalized, hp_column, name_column
@@ -99,6 +102,7 @@ def process_single_hp(
                 "fetched_raw_rows": 0,
                 "total_available": 0,
                 "request_url": "",
+                "debug_pages": [],
             }
             has_error = True
 

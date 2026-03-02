@@ -9,6 +9,7 @@ import streamlit as st
 
 from tools.analysis import (
     build_master_joined_table,
+    build_procurement_df,
     compute_management_summary,
     ensure_output_columns,
     publisher_suggestions_from_results,
@@ -72,7 +73,11 @@ def _value_matches_filter(value: Any, expected: str, field_name: str) -> bool:
     if value is None:
         return False
     if field_name in {"supplier_code", "entity_id"}:
-        return digits_only(value) == digits_only(expected)
+        left = digits_only(value)
+        right = digits_only(expected)
+        left_norm = left.lstrip("0") or "0" if left else ""
+        right_norm = right.lstrip("0") or "0" if right else ""
+        return left_norm == right_norm
     return expected.casefold() in str(value).casefold()
 
 
@@ -451,6 +456,156 @@ def render_result_panel(panel_title: str, result: dict[str, Any], download_key_p
     st.image(chart_bytes["monthly"], caption="Monthly time series chart", use_container_width=True)
 
 
+def render_procurement_view(
+    contract_df: pd.DataFrame, key_prefix: str, is_bulk: bool
+) -> None:
+    st.markdown("### Procurement view (רכש)")
+    st.write("רשימת התקשרויות רכש: על מה הייתה ההוצאה ומול מי ההתקשרות")
+
+    procurement_df = build_procurement_df(contract_df)
+    if procurement_df.empty:
+        st.info("No contract-spending records available for procurement view.")
+        return
+
+    year_options = (
+        procurement_df["שנה"]
+        .dropna()
+        .astype(int)
+        .drop_duplicates()
+        .sort_values(ascending=False)
+        .tolist()
+    )
+    selected_years = st.multiselect(
+        "סינון לפי שנה",
+        options=year_options,
+        default=year_options,
+        key=f"{key_prefix}_proc_years",
+    )
+    ministry_filter = st.text_input(
+        "סינון משרד (publisher)",
+        key=f"{key_prefix}_proc_ministry_filter",
+    ).strip()
+    keyword_filter = st.text_input(
+        "מילת מפתח בתיאור",
+        key=f"{key_prefix}_proc_keyword_filter",
+    ).strip()
+
+    filtered = procurement_df.copy()
+    if year_options and selected_years:
+        filtered = filtered.loc[
+            filtered["שנה"].fillna(-1).astype(int).isin(selected_years)
+        ]
+    if ministry_filter:
+        filtered = filtered.loc[
+            filtered["משרד"].astype(str).str.contains(ministry_filter, case=False, na=False)
+        ]
+    if keyword_filter:
+        filtered = filtered.loc[
+            filtered["תיאור"].astype(str).str.contains(keyword_filter, case=False, na=False)
+        ]
+
+    total_rows = len(filtered)
+    total_amount = pd.to_numeric(filtered["סך כולל"], errors="coerce").fillna(0).sum()
+
+    supplier_top = (
+        filtered["מול מי ההתקשרות"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .loc[lambda s: s.ne("")]
+    )
+    if not supplier_top.empty:
+        supplier_top = (
+            filtered.loc[supplier_top.index]
+            .assign(_supplier=supplier_top)
+            .groupby("_supplier")["סך כולל"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(3)
+        )
+    else:
+        supplier_top = pd.Series(dtype=float)
+
+    purpose_source = (
+        filtered["_purpose_base"]
+        if "_purpose_base" in filtered.columns
+        else filtered["תיאור"]
+    )
+    purpose_top = (
+        purpose_source.fillna("")
+        .astype(str)
+        .str.strip()
+        .loc[lambda s: s.ne("")]
+        .value_counts()
+        .head(3)
+    )
+
+    s_col1, s_col2, s_col3, s_col4 = st.columns(4)
+    s_col1.metric("# רשומות רכש", f"{total_rows:,}")
+    s_col2.metric("סך הוצאה (executed/volume)", human_number(total_amount))
+    with s_col3:
+        st.markdown("**Top 3 suppliers by amount**")
+        if supplier_top.empty:
+            st.caption("No supplier data")
+        else:
+            for supplier, amount in supplier_top.items():
+                st.markdown(f"- {supplier}: {human_number(amount)}")
+    with s_col4:
+        st.markdown("**Top 3 purposes by count**")
+        if purpose_top.empty:
+            st.caption("No purpose data")
+        else:
+            for purpose, count in purpose_top.items():
+                st.markdown(f"- {purpose}: {int(count):,}")
+
+    warning_count = int(filtered.get("_missing_amount", pd.Series(dtype=bool)).sum())
+    if warning_count > 0:
+        st.warning(
+            f"{warning_count:,} rows are missing both executed and volume; marked with ⚠ in 'סוג ההוצאה'."
+        )
+
+    required_cols = [
+        "שנה",
+        "תקנה תקציבית",
+        "משרד",
+        "סך כולל",
+        "תיאור",
+        "מול מי ההתקשרות",
+        "סוג ההוצאה",
+    ]
+    show_details = False
+    if is_bulk:
+        show_details = st.checkbox("show details", key=f"{key_prefix}_proc_show_details")
+
+    display_cols = required_cols.copy()
+    if show_details:
+        display_cols.extend(["hp", "company_name", "תג אזהרה"])
+
+    table_df = filtered[display_cols].copy()
+    st.dataframe(table_df, use_container_width=True)
+
+    export_df = table_df.copy()
+    csv_bytes = dataframe_to_csv_bytes(export_df)
+    excel_bytes = dataframe_to_excel_bytes(export_df, sheet_name="procurement_view")
+    e_col1, e_col2 = st.columns(2)
+    with e_col1:
+        st.download_button(
+            "Download procurement table (CSV)",
+            data=csv_bytes,
+            file_name=f"{key_prefix}_procurement.csv",
+            mime="text/csv",
+            key=f"{key_prefix}_proc_csv",
+        )
+    with e_col2:
+        st.download_button(
+            "Download procurement table (XLSX)",
+            data=excel_bytes,
+            file_name=f"{key_prefix}_procurement.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_proc_xlsx",
+        )
+
+
 def build_report_markdown(
     query_params: dict[str, Any],
     insights: list[str],
@@ -504,6 +659,10 @@ def run_bulk_pull(
 ) -> dict[str, Any]:
     progress = st.progress(0.0, text="Starting bulk pull...")
     status_placeholder = st.empty()
+    first_hp_value = (
+        str(normalized_hp_df.iloc[0]["hp"]) if not normalized_hp_df.empty else ""
+    )
+    first_hp_debug_pages: list[dict[str, Any]] = []
 
     status_rows: list[dict[str, Any]] = []
     cap_events: list[dict[str, Any]] = []
@@ -550,6 +709,7 @@ def run_bulk_pull(
                             "capped": False,
                             "fetched_raw_rows": 0,
                             "total_available": 0,
+                            "debug_pages": [],
                         }
                         for doc_type in selected_doc_types
                     },
@@ -569,6 +729,8 @@ def run_bulk_pull(
                 row_status[f"{doc_type}_status"] = doc_result.get("status", "error")
                 row_status[f"{doc_type}_rows"] = len(doc_records)
                 row_status[f"{doc_type}_error"] = doc_result.get("error", "")
+                if result.get("hp", hp) == first_hp_value:
+                    first_hp_debug_pages.extend(doc_result.get("debug_pages", []))
 
                 if doc_result.get("capped", False):
                     cap_events.append(
@@ -690,6 +852,10 @@ def run_bulk_pull(
         "report_bundle_bytes": report_bundle_bytes,
         "report_md": report_md,
         "publisher_suggestions": publisher_suggestions,
+        "first_hp_debug": {
+            "hp": first_hp_value,
+            "pages": first_hp_debug_pages,
+        },
     }
 
 
@@ -754,6 +920,39 @@ def render_bulk_results(result: dict[str, Any]) -> None:
 
     st.markdown("### Per-HP Status")
     st.dataframe(result["status_df"], use_container_width=True)
+
+    first_hp_debug = result.get("first_hp_debug", {})
+    with st.expander("Debug panel (first HP requests)", expanded=False):
+        st.markdown(
+            "Shows exact request URLs and hits/page for first uploaded HP."
+        )
+        st.write(f"First HP: {first_hp_debug.get('hp', '')}")
+        debug_pages = first_hp_debug.get("pages", [])
+        if debug_pages:
+            debug_df = pd.DataFrame(debug_pages)
+            debug_cols = [
+                "doc_type",
+                "server_strategy",
+                "q",
+                "filters",
+                "size",
+                "from",
+                "hits_returned",
+                "total_available",
+                "url",
+                "ok",
+                "error",
+            ]
+            debug_cols = [col for col in debug_cols if col in debug_df.columns]
+            st.dataframe(debug_df[debug_cols], use_container_width=True)
+        else:
+            st.caption("No debug pages captured for the first HP.")
+
+    render_procurement_view(
+        contract_df=result["contract_df"],
+        key_prefix="bulk_contract_spending",
+        is_bulk=True,
+    )
 
     st.markdown("### Combined Results by Doc-Type")
     st.markdown("**contract-spending**")
@@ -903,6 +1102,13 @@ if search_mode.startswith("1"):
         with tab_contracts:
             render_result_panel(
                 "Contract Spending", hp_results["contracts"], "hp_contract_spending"
+            )
+            contract_records = hp_results["contracts"].get("records", [])
+            contract_proc_df = records_to_dataframe_bulk(contract_records)
+            render_procurement_view(
+                contract_df=contract_proc_df,
+                key_prefix="hp_contract_spending",
+                is_bulk=False,
             )
         with tab_supports:
             render_result_panel("Supports", hp_results["supports"], "hp_supports")
@@ -1096,7 +1302,7 @@ else:
     normalized_hp_df = pd.DataFrame()
     if uploaded_file is not None:
         try:
-            uploaded_df = pd.read_excel(uploaded_file)
+            uploaded_df = pd.read_excel(uploaded_file, dtype=str, keep_default_na=False)
             normalized_hp_df, hp_col_name, name_col_name = normalize_uploaded_dataframe(uploaded_df)
             st.success(
                 "Detected HP column: "
