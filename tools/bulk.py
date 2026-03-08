@@ -71,7 +71,6 @@ def process_single_hp(
     keyword: str,
     page_size: int,
     row_cap: int,
-    debug_enabled: bool = False,
 ) -> dict[str, Any]:
     doc_results: dict[str, dict[str, Any]] = {}
     has_error = False
@@ -88,7 +87,6 @@ def process_single_hp(
                 keyword=keyword,
                 page_size=page_size,
                 row_cap=row_cap,
-                debug_enabled=debug_enabled,
             )
             doc_results[doc_type] = result
             if result.get("status") == "error":
@@ -105,10 +103,6 @@ def process_single_hp(
                 "total_available": 0,
                 "request_url": "",
                 "debug_pages": [],
-                "warning": "",
-                "fetched_candidates_rows": 0,
-                "local_matched_rows": 0,
-                "unverified_rows": 0,
             }
             has_error = True
 
